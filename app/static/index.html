@@ -159,6 +159,20 @@
 
       <datalist id="device-list"></datalist>
       <datalist id="metric-list"></datalist>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>导入批次 / 撤销</h2>
+          <button id="btn-refresh-imports" class="btn btn-small">刷新</button>
+        </div>
+        <div class="muted small maint-hint">
+          文件或文本导入时，会为本批首次遇到的每个（设备、指标、时间戳）记录<b>导入前快照</b>；
+          同批重复键只快照一次、仍由最后一条有效值覆盖。仅<b>最近一次</b>且快照完整的批次允许撤销：
+          撤销会在同一事务中删除本批新增事件、恢复被覆盖事件的值 / 原始内容 / 原批次归属，再刷新故障；
+          任一步失败全部回滚。旧数据中无快照的批次不能撤销。
+        </div>
+        <div id="import-batch-list" class="maint-list"></div>
+      </section>
     </aside>
 
     <main class="content">

@@ -314,6 +314,31 @@ body {
 .pill { font-size: 11px; padding: 1px 7px; border-radius: 10px; color: #fff; }
 .confirm-note { color: var(--muted); font-size: 12px; }
 
+/* import batches / undo */
+.import-batch-item {
+  border: 1px solid var(--border);
+  border-left: 3px solid #64748b;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fbfcfe;
+}
+.import-batch-item.latest { border-left-color: var(--primary); }
+.import-batch-item.revoked { opacity: 0.6; border-left-color: #94a3b8; background: #f8fafc; }
+.import-batch-item .rname { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.import-batch-item .rmeta { color: var(--muted); font-size: 12px; margin-top: 2px; line-height: 1.5; }
+.import-batch-item .batch-ops { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.batch-badge {
+  font-size: 10px; padding: 1px 7px; border-radius: 10px; white-space: nowrap;
+  border: 1px solid #cbd5e1; color: var(--muted); background: #f1f5f9;
+}
+.batch-badge.revoked { color: #475569; border-color: #cbd5e1; background: #e2e8f0; }
+.batch-badge.undoable { color: #1d4ed8; border-color: #93c5fd; background: #dbeafe; }
+.btn-undo {
+  border: 1px solid #fca5a5; background: #fff; color: var(--danger);
+  padding: 2px 9px; border-radius: 6px; cursor: pointer; font-size: 12px;
+}
+.btn-undo:hover { background: #fef2f2; }
+
 .anno-row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-bottom: 1px dashed var(--border); font-size: 13px; flex-wrap: wrap; }
 .anno-row:last-child { border-bottom: none; }
 .anno-chip { width: 12px; height: 12px; border-radius: 3px; background: var(--anno); }

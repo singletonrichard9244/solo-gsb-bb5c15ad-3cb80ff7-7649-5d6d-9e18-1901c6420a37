@@ -22,8 +22,31 @@ CREATE TABLE IF NOT EXISTS imports (
     imported_at REAL NOT NULL,
     total_rows INTEGER NOT NULL DEFAULT 0,
     inserted_rows INTEGER NOT NULL DEFAULT 0,
-    skipped_rows INTEGER NOT NULL DEFAULT 0
+    overwritten_rows INTEGER NOT NULL DEFAULT 0,
+    skipped_rows INTEGER NOT NULL DEFAULT 0,
+    -- 1 for batches imported with pre-import key snapshots (undoable);
+    -- 0 for batches created before the undo feature existed.
+    snapshot_complete INTEGER NOT NULL DEFAULT 0,
+    revoked_at REAL
 );
+
+-- Pre-import snapshot of every (device, metric, ts) key a batch touched for
+-- the first time within that batch. event_id NULL means the key did not exist
+-- before the batch; otherwise the row carries the overwritten event's value,
+-- raw content and original batch ownership for restore-on-undo.
+CREATE TABLE IF NOT EXISTS import_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+    device TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    ts REAL NOT NULL,
+    event_id INTEGER,
+    value REAL,
+    raw TEXT,
+    origin_import_id INTEGER,
+    UNIQUE (import_id, device, metric, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_import_snapshots_batch ON import_snapshots(import_id);
 
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +168,20 @@ def init_db() -> None:
     }
     if "reset_threshold" not in condition_cols:
         conn.execute("ALTER TABLE rule_conditions ADD COLUMN reset_threshold REAL")
+    # Migration for databases created before import-batch undo: the imports
+    # table gains the snapshot flag and the revocation timestamp.
+    import_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(imports)").fetchall()
+    }
+    if "overwritten_rows" not in import_cols:
+        conn.execute("ALTER TABLE imports ADD COLUMN overwritten_rows INTEGER NOT NULL DEFAULT 0")
+    if "snapshot_complete" not in import_cols:
+        # Pre-feature batches have no snapshots and must be refused on undo.
+        conn.execute(
+            "ALTER TABLE imports ADD COLUMN snapshot_complete INTEGER NOT NULL DEFAULT 0"
+        )
+    if "revoked_at" not in import_cols:
+        conn.execute("ALTER TABLE imports ADD COLUMN revoked_at REAL")
     conn.commit()
 
 
@@ -188,6 +225,7 @@ def reset_all() -> None:
         "maintenance_windows",
         "rules",
         "events",
+        "import_snapshots",
         "imports",
         "channel_ttls",
     ):
@@ -256,6 +294,56 @@ def upsert_event(
         (value, raw, import_id, existing["id"]),
     )
     return False
+
+
+def snapshot_import_key(
+    conn: sqlite3.Connection,
+    import_id: int,
+    seen_keys: set[tuple[str, str, float]],
+    device: str,
+    metric: str,
+    ts: float,
+) -> None:
+    """Record the pre-import state of a (device, metric, ts) key, once per batch.
+
+    The caller tracks keys already snapshotted in *seen_keys*: repeated keys
+    within the same batch snapshot only their first encounter even though the
+    last valid row still wins the overwrite.  An event row existing before the
+    batch is archived with its value, raw content and original batch ownership;
+    a missing key is stored with ``event_id IS NULL`` so undo deletes the event
+    the batch went on to create.
+    """
+    key = (device, metric, ts)
+    if key in seen_keys:
+        return
+    seen_keys.add(key)
+    existing = conn.execute(
+        "SELECT id, value, raw, import_id FROM events"
+        " WHERE device = ? AND metric = ? AND ts = ?",
+        (device, metric, ts),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO import_snapshots (import_id, device, metric, ts, event_id)"
+            " VALUES (?,?,?,?,?)",
+            (import_id, device, metric, ts, None),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO import_snapshots"
+            " (import_id, device, metric, ts, event_id, value, raw, origin_import_id)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                import_id,
+                device,
+                metric,
+                ts,
+                existing["id"],
+                existing["value"],
+                existing["raw"],
+                existing["import_id"],
+            ),
+        )
 
 
 def fetch_maintenance_window(window_id: int) -> dict | None:

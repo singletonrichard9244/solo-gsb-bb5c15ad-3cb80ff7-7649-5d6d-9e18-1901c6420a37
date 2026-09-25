@@ -275,6 +275,28 @@ def import_text(payload: ImportBody) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/imports")
+def list_imports() -> list[dict]:
+    """Import batches (newest first) with undo entry and eligibility flags."""
+    return services.list_import_batches()
+
+
+@app.post("/api/imports/{import_id}/undo")
+def undo_import(import_id: int) -> dict:
+    """Revoke the most recent, fully snapshotted import batch.
+
+    Deletes the batch's newly inserted events, restores overwritten events'
+    previous value/raw/batch ownership in one transaction, then refreshes
+    faults via the regular evaluation flow.
+    """
+    try:
+        return services.undo_import(import_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except services.UndoNotAllowed as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/channels")
 def channels() -> list[dict]:
     return services.list_channels()

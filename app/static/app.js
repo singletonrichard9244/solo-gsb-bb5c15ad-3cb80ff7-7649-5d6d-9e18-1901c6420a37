@@ -30,6 +30,7 @@ const state = {
   brush: null,
   ledgerSelected: new Set(),
   ledgerResult: null,
+  imports: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1369,6 +1370,61 @@ function renderLegend() {
      <span class="legend-item"><span style="color:#f97316">●</span> 选中故障的证据样本</span>`;
 }
 
+/* --------------------------- import batches / undo --------------------------- */
+
+async function loadImportBatches() {
+  state.imports = await api("/api/imports");
+  renderImportBatches();
+}
+
+function renderImportBatches() {
+  const box = $("import-batch-list");
+  if (!state.imports.length) {
+    box.innerHTML = `<div class="empty">尚无导入批次。</div>`;
+    return;
+  }
+  box.innerHTML = state.imports.map((b, idx) => {
+    const name = b.filename ? esc(b.filename) : "文本导入";
+    const cls = b.revoked ? "revoked" : (idx === 0 ? "latest" : "");
+    let badge;
+    if (b.revoked) badge = `<span class="batch-badge revoked">已撤销</span>`;
+    else if (b.can_undo) badge = `<span class="batch-badge undoable">可撤销（最近一次）</span>`;
+    else badge = `<span class="batch-badge" title="${esc(b.undo_reason || "")}">不可撤销</span>`;
+    const undoBtn = b.can_undo
+      ? `<button class="btn-undo" data-id="${b.id}">撤销本批</button>`
+      : "";
+    return `
+      <div class="import-batch-item ${cls}">
+        <div class="rname">
+          <span>#${b.id} · ${name}</span>
+          <span class="batch-ops">${badge}${undoBtn}</span>
+        </div>
+        <div class="rmeta">
+          ${fmtTime(b.imported_at)}<br/>
+          ${b.inserted_rows} 新增 · ${b.overwritten_rows} 覆盖 · ${b.skipped_rows} 跳过（共 ${b.total_rows} 行）
+          · 快照 ${b.snapshot_keys} 键（其中 ${b.overwritten_keys} 个为覆盖）
+          ${b.revoked ? `<br/>撤销于 ${fmtTime(b.revoked_at)}` : (!b.can_undo && b.undo_reason ? `<br/>${esc(b.undo_reason)}` : "")}
+        </div>
+      </div>`;
+  }).join("");
+  box.querySelectorAll(".btn-undo").forEach((btn) =>
+    btn.addEventListener("click", () => undoImportBatch(Number(btn.dataset.id))));
+}
+
+async function undoImportBatch(id) {
+  const batch = state.imports.find((b) => b.id === id);
+  const name = batch && batch.filename ? batch.filename : `批次 #${id}`;
+  if (!confirm(`确定撤销「${name}」？\n\n将删除本批新增事件、恢复被覆盖事件的原值与原批次归属，并刷新故障；失败会全部回滚。`)) return;
+  try {
+    const r = await api(`/api/imports/${id}/undo`, { method: "POST" });
+    const evalNote = r.evaluation && r.evaluation.rules_evaluated
+      ? `；已重算 ${r.evaluation.rules_evaluated} 条规则、${r.evaluation.fault_intervals} 个故障区间`
+      : "";
+    await reloadAll();
+    toast(`已撤销批次 #${id}：删除 ${r.deleted_events} 条新增事件，恢复 ${r.restored_events} 条覆盖事件${evalNote}`);
+  } catch (e) { toast(e.message, true); }
+}
+
 /* ------------------------------- events ------------------------------- */
 
 async function loadEvents(append = false) {
@@ -1451,6 +1507,7 @@ async function reloadAll() {
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
+  await loadImportBatches();
   updateStatus();
 }
 
@@ -1619,6 +1676,8 @@ function bind() {
   $("btn-clear-filter").addEventListener("click", clearFilter);
   $("btn-fit").addEventListener("click", clearFilter);
   $("btn-more-events").addEventListener("click", () => loadEvents(true));
+  $("btn-refresh-imports").addEventListener("click", () =>
+    loadImportBatches().catch((e) => toast(e.message, true)));
 
   $("tab-faults").addEventListener("click", () => switchFaultView("faults"));
   $("tab-events").addEventListener("click", () => switchFaultView("events"));

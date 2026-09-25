@@ -95,17 +95,17 @@ def import_events(
     rows = parse_jsonl(text)
     now = time.time()
 
-    conn = db.get_conn()
-    cur = conn.execute(
-        "INSERT INTO imports (filename, imported_at, total_rows) VALUES (?,?,?)",
-        (filename, now, len(rows)),
-    )
-    import_id = cur.lastrowid
-
     inserted = 0
     overwritten = 0
     skipped: list[dict] = []
+    seen_keys: set[tuple[str, str, float]] = set()
     with db.transaction() as tx:
+        cur = tx.execute(
+            "INSERT INTO imports (filename, imported_at, total_rows, snapshot_complete)"
+            " VALUES (?,?,?,1)",
+            (filename, now, len(rows)),
+        )
+        import_id = cur.lastrowid
         for index, row in enumerate(rows):
             try:
                 triples = _extract_metrics(
@@ -122,6 +122,10 @@ def import_events(
                         {"line": index + 1, "reason": f"non-numeric value for {device}/{metric}"}
                     )
                     continue
+                # Snapshot the pre-import state on this batch's first encounter
+                # of the key; later duplicates in the same batch still overwrite
+                # (the last valid value wins) but must not re-snapshot.
+                db.snapshot_import_key(tx, import_id, seen_keys, device, metric, ts)
                 is_new = db.upsert_event(
                     tx, device, metric, ts, num, json.dumps(row, ensure_ascii=False), import_id
                 )
@@ -130,8 +134,9 @@ def import_events(
                 else:
                     overwritten += 1
         tx.execute(
-            "UPDATE imports SET inserted_rows = ?, skipped_rows = ? WHERE id = ?",
-            (inserted, len(skipped), import_id),
+            "UPDATE imports SET inserted_rows = ?, overwritten_rows = ?, skipped_rows = ?"
+            " WHERE id = ?",
+            (inserted, overwritten, len(skipped), import_id),
         )
 
     result = {
@@ -145,6 +150,143 @@ def import_events(
     # New or back-filled samples — including older timestamps — change held
     # intervals and can bridge or open TTL gaps, so stored faults are
     # recomputed immediately (maintenance windows keep participating).
+    if reevaluate:
+        evaluation = evaluate_all_rules()
+        result["evaluation"] = {
+            "rules_evaluated": evaluation["rules_evaluated"],
+            "fault_intervals": evaluation["fault_intervals"],
+            "suppressed_segments": evaluation["suppressed_segments"],
+        }
+    return result
+
+
+class UndoNotAllowed(Exception):
+    """Raised when an import batch cannot be revoked (409 at the API)."""
+
+
+def list_import_batches() -> list[dict]:
+    """All import batches, newest first, with their undo eligibility."""
+    latest = db.query_one(
+        "SELECT MAX(id) AS id FROM imports WHERE revoked_at IS NULL"
+    )
+    latest_id = latest["id"] if latest is not None else None
+    rows = db.query(
+        """
+        SELECT i.*,
+               (SELECT COUNT(*) FROM import_snapshots s WHERE s.import_id = i.id) AS snapshot_rows,
+               (SELECT SUM(CASE WHEN s.event_id IS NOT NULL THEN 1 ELSE 0 END)
+                  FROM import_snapshots s WHERE s.import_id = i.id) AS overwritten_keys
+        FROM imports i
+        ORDER BY i.id DESC
+        """
+    )
+    batches: list[dict] = []
+    for row in rows:
+        batch = {
+            "id": row["id"],
+            "filename": row["filename"],
+            "imported_at": row["imported_at"],
+            "total_rows": row["total_rows"],
+            "inserted_rows": row["inserted_rows"],
+            "overwritten_rows": row["overwritten_rows"],
+            "skipped_rows": row["skipped_rows"],
+            "snapshot_keys": row["snapshot_rows"],
+            "overwritten_keys": row["overwritten_keys"] or 0,
+            "snapshot_complete": bool(row["snapshot_complete"]),
+            "revoked": row["revoked_at"] is not None,
+            "revoked_at": row["revoked_at"],
+            "can_undo": False,
+            "undo_reason": None,
+        }
+        if batch["revoked"]:
+            batch["undo_reason"] = "该批次已撤销"
+        elif not batch["snapshot_complete"]:
+            # Batch imported before the undo feature: nothing to restore from.
+            batch["undo_reason"] = "旧批次缺少导入前快照，无法撤销"
+        elif row["id"] != latest_id:
+            batch["undo_reason"] = "仅允许撤销最近一次未撤销的导入批次"
+        else:
+            batch["can_undo"] = True
+        batches.append(batch)
+    return batches
+
+
+def undo_import(import_id: int, reevaluate: bool = True) -> dict:
+    """Revoke one import batch atomically.
+
+    Only the most recent non-revoked batch whose pre-import snapshots are
+    complete may be revoked.  In a single transaction the batch's newly
+    inserted events are deleted, while events it overwritten get back their
+    previous value, raw content and original batch ownership; the batch is
+    then marked revoked.  Any failure rolls the whole operation back.
+    """
+    row = db.query_one("SELECT * FROM imports WHERE id = ?", (import_id,))
+    if row is None:
+        raise KeyError(f"import batch {import_id} not found")
+    if row["revoked_at"] is not None:
+        raise UndoNotAllowed("该导入批次已撤销，不能重复撤销")
+    if not row["snapshot_complete"]:
+        raise UndoNotAllowed("该批次导入时未记录快照（旧数据），无法撤销")
+    latest = db.query_one(
+        "SELECT MAX(id) AS id FROM imports WHERE revoked_at IS NULL"
+    )
+    if latest is None or latest["id"] != import_id:
+        raise UndoNotAllowed("仅允许撤销最近一次导入批次，请先撤销其后的导入")
+
+    with db.transaction() as tx:
+        snapshots = tx.execute(
+            "SELECT * FROM import_snapshots WHERE import_id = ?"
+            " ORDER BY id",
+            (import_id,),
+        ).fetchall()
+        deleted = 0
+        restored = 0
+        for snap in snapshots:
+            if snap["event_id"] is None:
+                # The batch created this key: delete the current event, but
+                # only if it still belongs to the batch being revoked.
+                cur = tx.execute(
+                    "DELETE FROM events"
+                    " WHERE device = ? AND metric = ? AND ts = ? AND import_id = ?",
+                    (snap["device"], snap["metric"], snap["ts"], import_id),
+                )
+                if cur.rowcount == 0:
+                    raise RuntimeError(
+                        f"snapshot consistency broken for new key"
+                        f" {snap['device']}/{snap['metric']}@{snap['ts']}"
+                    )
+                deleted += cur.rowcount
+            else:
+                # The batch overwrote a pre-existing event: put its value,
+                # raw content and original batch ownership back.
+                cur = tx.execute(
+                    "UPDATE events SET value = ?, raw = ?, import_id = ?"
+                    " WHERE id = ? AND import_id = ?",
+                    (
+                        snap["value"],
+                        snap["raw"],
+                        snap["origin_import_id"],
+                        snap["event_id"],
+                        import_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        f"snapshot consistency broken for event {snap['event_id']}"
+                    )
+                restored += 1
+        tx.execute(
+            "UPDATE imports SET revoked_at = ? WHERE id = ?",
+            (time.time(), import_id),
+        )
+
+    result = {
+        "import_id": import_id,
+        "deleted_events": deleted,
+        "restored_events": restored,
+    }
+    # Faults derive from the current events, so the existing evaluation flow
+    # refreshes them after the data is back to its pre-batch state.
     if reevaluate:
         evaluation = evaluate_all_rules()
         result["evaluation"] = {
