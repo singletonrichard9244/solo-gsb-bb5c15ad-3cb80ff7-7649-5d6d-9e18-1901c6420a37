@@ -296,6 +296,34 @@ def get_events(
 
 
 # --------------------------------------------------------------------------- #
+# Import batch undo
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/imports")
+def get_imports() -> list[dict]:
+    """Import batches (newest first) with per-batch undo availability."""
+    return services.list_import_batches()
+
+
+@app.post("/api/imports/{import_id}/undo")
+def undo_import(import_id: int) -> dict:
+    """Undo the most recent import batch from its pre-import snapshots.
+
+    Only the latest non-undone batch with a complete snapshot set can be
+    undone; batches imported before snapshots existed are rejected.  The
+    delete/restore/mark-undone writes happen in one transaction, then stored
+    faults are recomputed through the existing evaluation flow.
+    """
+    try:
+        return services.undo_import(import_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except services.UndoConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
 # Rules
 # --------------------------------------------------------------------------- #
 

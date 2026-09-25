@@ -43,6 +43,15 @@
       <button id="btn-do-import" class="btn btn-primary">开始导入</button>
       <span id="import-result" class="import-result"></span>
     </div>
+    <details class="import-batches" id="import-batches-details">
+      <summary>导入批次与撤销（仅最近一次导入且快照完整的批次可撤销）</summary>
+      <p class="muted small">
+        每次导入为本批首次遇到的每个（设备、指标、时间戳）记录导入前快照，同批重复键只记一次、仍由最后一条有效值覆盖。
+        撤销在最近一次导入且快照完整时可用：在同一事务中删除本批新增事件、恢复被覆盖事件的值 / 原始内容 / 原批次归属，
+        并将批次标记为已撤销，随后自动重新评估全部规则；失败则全部回滚。旧数据中无快照的批次不可撤销；清空数据会同步清除快照。
+      </p>
+      <div id="import-batches"></div>
+    </details>
   </div>
 
   <div class="layout">

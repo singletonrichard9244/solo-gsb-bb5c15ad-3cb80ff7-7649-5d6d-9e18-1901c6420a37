@@ -28,6 +28,10 @@ DEFAULT_TS_FIELD = "ts"
 DEFAULT_VALUE_FIELD = "value"
 
 
+class UndoConflict(Exception):
+    """The import batch exists but cannot be undone in the current state."""
+
+
 def parse_jsonl(text: str) -> list[dict]:
     """Parse JSONL; a top-level JSON array is also accepted."""
     text = text.strip()
@@ -105,6 +109,9 @@ def import_events(
     inserted = 0
     overwritten = 0
     skipped: list[dict] = []
+    # Keys already snapshotted by this batch: the pre-import state of each
+    # (device, metric, ts) is recorded once, on the batch's first encounter.
+    snapshotted: set[tuple[str, str, float]] = set()
     with db.transaction() as tx:
         for index, row in enumerate(rows):
             try:
@@ -122,6 +129,10 @@ def import_events(
                         {"line": index + 1, "reason": f"non-numeric value for {device}/{metric}"}
                     )
                     continue
+                key = (device, metric, ts)
+                if key not in snapshotted:
+                    db.record_event_snapshot(tx, import_id, device, metric, ts)
+                    snapshotted.add(key)
                 is_new = db.upsert_event(
                     tx, device, metric, ts, num, json.dumps(row, ensure_ascii=False), import_id
                 )
@@ -153,6 +164,126 @@ def import_events(
             "suppressed_segments": evaluation["suppressed_segments"],
         }
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Import batch undo
+# --------------------------------------------------------------------------- #
+
+
+def list_import_batches() -> list[dict]:
+    """Import batches (newest first) with per-batch undo availability.
+
+    A batch is undoable when it is the most recent non-undone import and its
+    pre-import snapshot set is complete (batches imported before the undo
+    feature existed have no snapshots and are explicitly not undoable).
+    """
+    rows = db.fetch_import_batches()
+    latest_active: int | None = None
+    for row in rows:  # rows arrive newest-first
+        if row["undone_at"] is None:
+            latest_active = row["id"]
+            break
+    batches = []
+    for row in rows:
+        complete = row["missing_snapshots"] == 0
+        undoable = (
+            row["undone_at"] is None and row["id"] == latest_active and complete
+        )
+        batches.append(
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "imported_at": row["imported_at"],
+                "total_rows": row["total_rows"],
+                "inserted_rows": row["inserted_rows"],
+                "skipped_rows": row["skipped_rows"],
+                "undone_at": row["undone_at"],
+                "undone": row["undone_at"] is not None,
+                "snapshot_count": row["snapshot_count"],
+                "snapshot_inserts": row["snapshot_inserts"],
+                "snapshot_overwrites": row["snapshot_overwrites"],
+                "snapshot_complete": complete,
+                "is_latest_active": row["id"] == latest_active,
+                "undoable": undoable,
+            }
+        )
+    return batches
+
+
+def undo_import(import_id: int) -> dict:
+    """Undo the most recent import batch in a single transaction.
+
+    Events the batch newly inserted are deleted; events it overwrote get
+    their pre-import value, raw content and original batch attribution
+    restored from the snapshots; the batch is then marked undone.  Any
+    failure rolls the whole transaction back.  Afterwards the stored faults
+    are refreshed through the existing evaluation flow.
+
+    Raises ``KeyError`` for an unknown batch and ``UndoConflict`` when the
+    batch is already undone, is not the latest active import, or lacks a
+    complete snapshot set (e.g. imported before this feature existed).
+    """
+    row = db.query_one("SELECT * FROM imports WHERE id = ?", (import_id,))
+    if row is None:
+        raise KeyError(f"import batch {import_id} not found")
+    if row["undone_at"] is not None:
+        raise UndoConflict(f"批次 #{import_id} 已撤销，不能重复撤销")
+    latest = db.query_one(
+        "SELECT MAX(id) AS latest FROM imports WHERE undone_at IS NULL"
+    )["latest"]
+    if latest != import_id:
+        raise UndoConflict(
+            f"只能撤销最近一次导入的批次（当前可撤销的是 #{latest}），批次 #{import_id} 不可撤销"
+        )
+    missing = db.count_missing_snapshots(import_id)
+    if missing:
+        raise UndoConflict(
+            f"批次 #{import_id} 缺少 {missing} 条导入前快照"
+            "（可能为快照功能上线前导入的旧数据），无法撤销"
+        )
+
+    snapshots = db.query(
+        "SELECT * FROM import_event_snapshots WHERE import_id = ? ORDER BY id",
+        (import_id,),
+    )
+    deleted = 0
+    restored = 0
+    with db.transaction() as tx:
+        for snap in snapshots:
+            if snap["event_id"] is None:
+                # The key did not exist before this import: drop the event.
+                cur = tx.execute(
+                    "DELETE FROM events"
+                    " WHERE device = ? AND metric = ? AND ts = ? AND import_id = ?",
+                    (snap["device"], snap["metric"], snap["ts"], import_id),
+                )
+                deleted += cur.rowcount
+            else:
+                # The key existed: restore value, raw content and the
+                # original batch attribution of the overwritten event.
+                cur = tx.execute(
+                    "UPDATE events SET value = ?, raw = ?, import_id = ? WHERE id = ?",
+                    (snap["value"], snap["raw"], snap["prev_import_id"], snap["event_id"]),
+                )
+                restored += cur.rowcount
+        tx.execute(
+            "UPDATE imports SET undone_at = ? WHERE id = ?",
+            (time.time(), import_id),
+        )
+
+    # Same refresh path as imports / TTL / maintenance writes.
+    evaluation = evaluate_all_rules()
+    return {
+        "import_id": import_id,
+        "deleted_events": deleted,
+        "restored_events": restored,
+        "evaluation": {
+            "rules_evaluated": evaluation["rules_evaluated"],
+            "fault_intervals": evaluation["fault_intervals"],
+            "suppressed_segments": evaluation["suppressed_segments"],
+        },
+    }
 
 
 def _load_events_index() -> tuple[dict[tuple[str, str], list[Event]], float | None]:

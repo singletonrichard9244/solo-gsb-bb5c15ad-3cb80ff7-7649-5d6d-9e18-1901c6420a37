@@ -22,8 +22,28 @@ CREATE TABLE IF NOT EXISTS imports (
     imported_at REAL NOT NULL,
     total_rows INTEGER NOT NULL DEFAULT 0,
     inserted_rows INTEGER NOT NULL DEFAULT 0,
-    skipped_rows INTEGER NOT NULL DEFAULT 0
+    skipped_rows INTEGER NOT NULL DEFAULT 0,
+    undone_at REAL
 );
+
+-- Pre-import event snapshots, one row per (batch, device, metric, ts) key the
+-- batch touched, recorded on the batch's FIRST encounter of the key (before
+-- any write from that batch).  event_id/value/raw/prev_import_id are all NULL
+-- when the key did not exist before the import; undo uses that to tell
+-- "delete the inserted event" apart from "restore the overwritten event".
+CREATE TABLE IF NOT EXISTS import_event_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+    device TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    ts REAL NOT NULL,
+    event_id INTEGER,
+    value REAL,
+    raw TEXT,
+    prev_import_id INTEGER,
+    UNIQUE (import_id, device, metric, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_snap_import ON import_event_snapshots(import_id);
 
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +165,15 @@ def init_db() -> None:
     }
     if "reset_threshold" not in condition_cols:
         conn.execute("ALTER TABLE rule_conditions ADD COLUMN reset_threshold REAL")
+    # Migration for databases created before import-batch undo: the imports
+    # table needs the undone marker (snapshots of old batches stay absent, so
+    # those batches are reported as not undoable).
+    import_cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(imports)").fetchall()
+    }
+    if "undone_at" not in import_cols:
+        conn.execute("ALTER TABLE imports ADD COLUMN undone_at REAL")
     conn.commit()
 
 
@@ -188,6 +217,7 @@ def reset_all() -> None:
         "maintenance_windows",
         "rules",
         "events",
+        "import_event_snapshots",
         "imports",
         "channel_ttls",
     ):
@@ -256,6 +286,103 @@ def upsert_event(
         (value, raw, import_id, existing["id"]),
     )
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Import batch undo (pre-import event snapshots)
+# --------------------------------------------------------------------------- #
+
+
+def record_event_snapshot(
+    conn: sqlite3.Connection,
+    import_id: int,
+    device: str,
+    metric: str,
+    ts: float,
+) -> None:
+    """Snapshot the pre-import state of (device, metric, ts) for batch undo.
+
+    Must be called on the batch's FIRST encounter of the key, before any write
+    from this batch; the caller deduplicates keys within the batch.  A key that
+    does not exist yet is recorded with all-NULL event fields so undo knows to
+    delete the event the batch is about to insert.
+    """
+    existing = conn.execute(
+        "SELECT id, value, raw, import_id FROM events"
+        " WHERE device = ? AND metric = ? AND ts = ?",
+        (device, metric, ts),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO import_event_snapshots"
+            " (import_id, device, metric, ts, event_id, value, raw, prev_import_id)"
+            " VALUES (?,?,?,?,NULL,NULL,NULL,NULL)",
+            (import_id, device, metric, ts),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO import_event_snapshots"
+            " (import_id, device, metric, ts, event_id, value, raw, prev_import_id)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                import_id,
+                device,
+                metric,
+                ts,
+                existing["id"],
+                existing["value"],
+                existing["raw"],
+                existing["import_id"],
+            ),
+        )
+
+
+def count_missing_snapshots(import_id: int) -> int:
+    """Events currently attributed to the batch that have no snapshot row.
+
+    Zero means the snapshot set is complete; batches imported before the undo
+    feature existed have no snapshots at all and are reported incomplete.
+    """
+    return query_one(
+        """
+        SELECT COUNT(*) AS c FROM events e
+        WHERE e.import_id = ? AND NOT EXISTS (
+            SELECT 1 FROM import_event_snapshots s
+            WHERE s.import_id = e.import_id AND s.device = e.device
+              AND s.metric = e.metric AND s.ts = e.ts
+        )
+        """,
+        (import_id,),
+    )["c"]
+
+
+def fetch_import_batches() -> list[dict]:
+    """All import batches, newest first, with snapshot-completeness stats."""
+    rows = query(
+        """
+        SELECT i.id, i.filename, i.imported_at, i.total_rows, i.inserted_rows,
+               i.skipped_rows, i.undone_at,
+               COALESCE(s.snap_count, 0) AS snapshot_count,
+               COALESCE(s.snap_inserts, 0) AS snapshot_inserts,
+               COALESCE(s.snap_overwrites, 0) AS snapshot_overwrites,
+               (SELECT COUNT(*) FROM events e
+                 WHERE e.import_id = i.id AND NOT EXISTS (
+                     SELECT 1 FROM import_event_snapshots x
+                     WHERE x.import_id = e.import_id AND x.device = e.device
+                       AND x.metric = e.metric AND x.ts = e.ts
+                 )) AS missing_snapshots
+        FROM imports i
+        LEFT JOIN (
+            SELECT import_id,
+                   COUNT(*) AS snap_count,
+                   SUM(event_id IS NULL) AS snap_inserts,
+                   SUM(event_id IS NOT NULL) AS snap_overwrites
+            FROM import_event_snapshots GROUP BY import_id
+        ) s ON s.import_id = i.id
+        ORDER BY i.id DESC
+        """
+    )
+    return [dict(r) for r in rows]
 
 
 def fetch_maintenance_window(window_id: int) -> dict | None:

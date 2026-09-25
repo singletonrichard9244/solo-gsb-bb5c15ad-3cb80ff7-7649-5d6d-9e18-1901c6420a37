@@ -30,6 +30,7 @@ const state = {
   brush: null,
   ledgerSelected: new Set(),
   ledgerResult: null,
+  imports: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -577,6 +578,67 @@ async function clearTtl(device, metric) {
     await reloadAll();
     toast(`已清除 ${label} 的有效期，规则已重新评估`);
   } catch (e) { toast(e.message, true); }
+}
+
+/* ----------------------------- import batch undo ----------------------------- */
+
+async function loadImports() {
+  try {
+    state.imports = await api("/api/imports");
+  } catch (e) {
+    state.imports = [];
+    toast(e.message, true);
+  }
+  renderImports();
+}
+
+function renderImports() {
+  const box = $("import-batches");
+  const batches = state.imports || [];
+  if (!batches.length) {
+    box.innerHTML = `<div class="empty">尚无导入批次。</div>`;
+    return;
+  }
+  box.innerHTML = batches.map((b) => {
+    const name = b.filename ? esc(b.filename) : "（粘贴文本导入）";
+    let action;
+    if (b.undone) {
+      action = `<span class="tag batch-tag-undone">已撤销 · ${fmtTime(b.undone_at)}</span>`;
+    } else if (b.undoable) {
+      action = `<button class="btn btn-small btn-danger act-undo" data-id="${b.id}">撤销此批次</button>`;
+    } else if (!b.snapshot_complete) {
+      action = `<span class="tag">无导入前快照（旧数据），不可撤销</span>`;
+    } else {
+      action = `<span class="tag">仅最近一次导入可撤销</span>`;
+    }
+    const snap = b.snapshot_complete
+      ? `快照 ${b.snapshot_count}（新增 ${b.snapshot_inserts} / 覆盖 ${b.snapshot_overwrites}）`
+      : "无导入前快照";
+    return `
+      <div class="batch-item ${b.undone ? "undone" : ""}">
+        <div class="batch-head">
+          <span class="batch-title">批次 #${b.id} · ${name}</span>
+          ${action}
+        </div>
+        <div class="rmeta">${fmtTime(b.imported_at)} · 共 ${b.total_rows} 行 · 写入 ${b.inserted_rows} · 跳过 ${b.skipped_rows} · ${snap}</div>
+      </div>`;
+  }).join("");
+  box.querySelectorAll(".act-undo").forEach((btn) =>
+    btn.addEventListener("click", () => undoImport(Number(btn.dataset.id))));
+}
+
+async function undoImport(id) {
+  if (!confirm(
+    `撤销导入批次 #${id}？\n将在同一事务中删除本批新增事件、恢复被覆盖事件的值/原始内容/原批次归属，` +
+    `并将批次标记为已撤销，随后自动重新评估全部规则。`)) return;
+  try {
+    const r = await api(`/api/imports/${id}/undo`, { method: "POST" });
+    await reloadAll();
+    toast(`批次 #${id} 已撤销：删除新增事件 ${r.deleted_events} 条，恢复被覆盖事件 ${r.restored_events} 条，故障已重算`);
+  } catch (e) {
+    toast(e.message, true);
+    await loadImports();
+  }
 }
 
 /* ------------------------------ timeline ------------------------------ */
@@ -1451,6 +1513,7 @@ async function reloadAll() {
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
+  await loadImports();
   updateStatus();
 }
 

@@ -102,6 +102,22 @@ body {
 .import-result.ok { color: #15803d; }
 .import-result.err { color: var(--danger); }
 
+.import-batches { border-top: 1px dashed var(--border); padding-top: 8px; }
+.import-batches summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.import-batches summary:hover { color: var(--text); }
+#import-batches { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.batch-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fbfcfe;
+}
+.batch-item.undone { opacity: 0.62; }
+.batch-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.batch-title { font-weight: 600; font-size: 13px; }
+.batch-item .rmeta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.batch-tag-undone { background: #f1f5f9; border-color: #cbd5e1; color: #475569; }
+
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 
